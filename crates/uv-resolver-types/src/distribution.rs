@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use uv_distribution::Metadata;
 use uv_distribution_types::{
@@ -8,9 +8,64 @@ use uv_distribution_types::{
 };
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::Version;
+use uv_pep508::{MarkerExpression, MarkerOperator, MarkerTree, MarkerValueString};
+use uv_platform_tags::LanguageTag;
 use uv_pypi_types::HashDigests;
 
 use crate::{MetadataResponse, UniversalMarker};
+
+/// The implementation constraints implied by a wheel's language tag.
+#[derive(Debug)]
+pub struct WheelImplementationMarkers {
+    /// The resolver checks wheel coverage using `platform_python_implementation`.
+    pub coverage: MarkerTree,
+    /// The lockfile also checks `implementation_name` when filtering wheels.
+    pub reachability: MarkerTree,
+}
+
+impl WheelImplementationMarkers {
+    /// Return the constraints for a tag that names a specific implementation.
+    pub fn from_tag(tag: LanguageTag) -> Option<&'static Self> {
+        fn equal(key: MarkerValueString, value: &str) -> MarkerTree {
+            MarkerTree::expression(MarkerExpression::String {
+                key,
+                operator: MarkerOperator::Equal,
+                value: value.into(),
+            })
+        }
+
+        fn markers(name: &str, platform: &str) -> WheelImplementationMarkers {
+            let coverage = equal(MarkerValueString::PlatformPythonImplementation, platform);
+            let name = equal(MarkerValueString::ImplementationName, name);
+            WheelImplementationMarkers {
+                coverage,
+                reachability: name.and(coverage),
+            }
+        }
+
+        static CPYTHON: LazyLock<WheelImplementationMarkers> =
+            LazyLock::new(|| markers("cpython", "CPython"));
+        static PYPY: LazyLock<WheelImplementationMarkers> =
+            LazyLock::new(|| markers("pypy", "PyPy"));
+        static GRAALPY: LazyLock<WheelImplementationMarkers> =
+            LazyLock::new(|| markers("graalpy", "GraalVM"));
+        // Pyston reports `CPython` for `platform.python_implementation()`. The resolver uses
+        // a distinct value to avoid counting Pyston wheels toward CPython coverage.
+        static PYSTON: LazyLock<WheelImplementationMarkers> =
+            LazyLock::new(|| WheelImplementationMarkers {
+                coverage: equal(MarkerValueString::PlatformPythonImplementation, "Pyston"),
+                ..markers("pyston", "CPython")
+            });
+
+        match tag {
+            LanguageTag::None | LanguageTag::Python { .. } => None,
+            LanguageTag::CPython { .. } | LanguageTag::CPythonMajor { .. } => Some(&CPYTHON),
+            LanguageTag::PyPy { .. } => Some(&PYPY),
+            LanguageTag::GraalPy { .. } => Some(&GRAALPY),
+            LanguageTag::Pyston { .. } => Some(&PYSTON),
+        }
+    }
+}
 
 /// The part of a package represented by a resolver graph node.
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]

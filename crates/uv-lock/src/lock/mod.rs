@@ -62,7 +62,7 @@ use uv_pypi_types::{
 use uv_redacted::{SafeUrl, SafeUrlError};
 use uv_resolver_types::{
     AnnotatedDist, ConflictMarker, DistributionMetadataIndex, MetadataResponse, PackageRole,
-    ResolutionGraphNode, ResolverOutput, UniversalMarker,
+    ResolutionGraphNode, ResolverOutput, UniversalMarker, WheelImplementationMarkers,
 };
 use uv_small_str::SmallString;
 use uv_types::{BuildContext, HashStrategy};
@@ -153,6 +153,9 @@ static MAC_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
 static ANDROID_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
     let pep508 = MarkerTree::from_str("sys_platform == 'android'").unwrap();
     UniversalMarker::new(pep508, ConflictMarker::TRUE)
+});
+static EMSCRIPTEN_MARKERS: LazyLock<MarkerTree> = LazyLock::new(|| {
+    MarkerTree::from_str("os_name == 'posix' and sys_platform == 'emscripten'").unwrap()
 });
 static ARM_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
     let pep508 =
@@ -7014,6 +7017,7 @@ impl Package {
             index_locations,
             requires_python,
             wheel_marker,
+            sdist.is_some(),
         )?;
         let metadata = if id.source.is_immutable() {
             PackageMetadata::default()
@@ -9219,6 +9223,7 @@ impl Wheel {
         index_locations: &IndexLocations,
         requires_python: &RequiresPython,
         marker: &UniversalMarker,
+        has_sdist: bool,
     ) -> Result<Vec<Self>, LockError> {
         let dist = match &annotated_dist.dist {
             // We pass empty installed packages for locking.
@@ -9251,8 +9256,14 @@ impl Wheel {
         // `--find-links`.
         let index = annotated_dist.index();
         let wheels = wheels.iter().filter(|wheel| Some(&wheel.index) == index);
-        // Registry entries in uv.lock need no artifact for metadata validation.
-        reachable_wheels(wheels, requires_python, marker, None, WheelFallback::None)
+        // Frozen exports to pylock.toml need an artifact for each package. Limit the fallback
+        // to compatible platforms since uv.lock checks the index hash of every included wheel.
+        let fallback = if has_sdist {
+            WheelFallback::None
+        } else {
+            WheelFallback::PlatformCompatible
+        };
+        reachable_wheels(wheels, requires_python, marker, None, fallback)
             .map(|wheel| Self::from_registry_wheel(wheel, index_locations))
             .collect()
     }
@@ -10709,6 +10720,8 @@ fn canonical_marker_trees(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WheelFallback {
     None,
+    /// Keep eligible wheels that pass the platform checks if none match the implementation.
+    PlatformCompatible,
     /// Keep wheels that satisfy the Python version and any explicit target tags.
     Eligible,
 }
@@ -10723,11 +10736,15 @@ fn reachable_wheels<'a>(
 ) -> impl Iterator<Item = &'a RegistryBuiltWheel> {
     let wheels =
         wheels.filter(move |wheel| is_wheel_eligible(&wheel.filename, requires_python, tags));
-    filter_wheels(
+    let wheels = filter_wheels(
         wheels,
         fallback == WheelFallback::Eligible,
         move |filename| marker.is_true() || !is_wheel_unreachable_for_marker(filename, marker),
-    )
+    );
+    let marker = marker.combined();
+    filter_wheels(wheels, fallback != WheelFallback::None, move |filename| {
+        marker.is_true() || !marker.is_disjoint(wheel_environment_marker(filename))
+    })
 }
 
 /// If a wheel is required and none match the marker, retain the eligible wheels.
@@ -10940,6 +10957,58 @@ fn is_wheel_unreachable_for_marker(filename: &WheelFilename, marker: &UniversalM
     false
 }
 
+/// The implementation and OS must match the same environment. Check the machine separately
+/// since 32-bit Python on `x86_64` Linux can report `platform_machine == 'x86_64'` and use
+/// `i686` wheels.
+fn wheel_environment_marker(filename: &WheelFilename) -> MarkerTree {
+    wheel_implementation_marker(filename.python_tags())
+        .and(wheel_operating_system_marker(filename.platform_tags()))
+}
+
+/// The implementations allowed by the wheel's recognized language tags.
+fn wheel_implementation_marker(tags: &[LanguageTag]) -> MarkerTree {
+    if tags.is_empty() {
+        return MarkerTree::TRUE;
+    }
+    let mut marker = MarkerTree::FALSE;
+    for tag in tags {
+        let Some(implementation) = WheelImplementationMarkers::from_tag(*tag) else {
+            return MarkerTree::TRUE;
+        };
+        marker = marker.or(implementation.reachability);
+    }
+    marker
+}
+
+/// The operating systems allowed by the wheel's recognized platform tags.
+fn wheel_operating_system_marker(platforms: &[PlatformTag]) -> MarkerTree {
+    if platforms.is_empty() {
+        return MarkerTree::TRUE;
+    }
+    let mut marker = MarkerTree::FALSE;
+    for platform in platforms {
+        let os = if platform.is_linux() {
+            LINUX_MARKERS.combined()
+        } else if platform.is_windows() {
+            WINDOWS_MARKERS.combined()
+        } else if platform.is_macos() {
+            MAC_MARKERS.combined()
+        } else if platform.is_android() {
+            // Android interpreters before Python 3.13 report `sys_platform == 'linux'`.
+            ANDROID_MARKERS.combined().or(LINUX_MARKERS.combined())
+        } else if matches!(
+            platform,
+            PlatformTag::Pyodide { .. } | PlatformTag::PyEmscripten { .. }
+        ) {
+            *EMSCRIPTEN_MARKERS
+        } else {
+            return MarkerTree::TRUE;
+        };
+        marker = marker.or(os);
+    }
+    marker
+}
+
 #[cfg(test)]
 mod tests {
     use std::slice;
@@ -10950,6 +11019,28 @@ mod tests {
     use uv_warnings::anstream;
 
     use super::*;
+
+    #[test]
+    fn filter_wheels_with_unconstrained_implementations_by_os() {
+        let windows_or_macos = WINDOWS_MARKERS.combined().or(MAC_MARKERS.combined());
+        let emscripten: MarkerTree = "os_name == 'posix' and sys_platform == 'emscripten'"
+            .parse()
+            .expect("valid marker");
+        for (filename, expected) in [
+            (
+                "demo-1.0-py3-none-win_amd64.macosx_11_0_arm64.whl",
+                windows_or_macos,
+            ),
+            ("demo-1.0-py3-none-pyodide_2025_0_wasm32.whl", emscripten),
+            (
+                "demo-1.0-py3-none-pyemscripten_2026_0_wasm32.whl",
+                emscripten,
+            ),
+        ] {
+            let wheel = filename.parse().expect("valid wheel");
+            assert_eq!(wheel_environment_marker(&wheel), expected, "{filename}");
+        }
+    }
 
     /// The disjunctions retain an impossible platform combination across decision branches.
     /// Removing the extra must still leave that combination unreachable.

@@ -17,6 +17,7 @@ use uv_platform_tags::{
     AbiTag, BinaryFormat, IncompatibleTag, LanguageTag, PlatformTag, TagPriority, Tags,
 };
 use uv_pypi_types::{HashDigest, Yanked};
+use uv_resolver_types::WheelImplementationMarkers;
 
 use crate::known_platform::KnownPlatform;
 use crate::resolved::ResolvedDistRef;
@@ -1268,39 +1269,8 @@ fn implied_python_markers(filename: &WheelFilename) -> MarkerTree {
             }
         };
 
-        // Then, add implementation markers for implementation-specific tags
-        match python_tag {
-            LanguageTag::None | LanguageTag::Python { .. } => {
-                // No implementation marker needed
-            }
-            LanguageTag::CPython { .. } | LanguageTag::CPythonMajor { .. } => {
-                tree = tree.and(MarkerTree::expression(MarkerExpression::String {
-                    key: MarkerValueString::PlatformPythonImplementation,
-                    operator: MarkerOperator::Equal,
-                    value: arcstr::literal!("CPython"),
-                }));
-            }
-            LanguageTag::PyPy { .. } => {
-                tree = tree.and(MarkerTree::expression(MarkerExpression::String {
-                    key: MarkerValueString::PlatformPythonImplementation,
-                    operator: MarkerOperator::Equal,
-                    value: arcstr::literal!("PyPy"),
-                }));
-            }
-            LanguageTag::GraalPy { .. } => {
-                tree = tree.and(MarkerTree::expression(MarkerExpression::String {
-                    key: MarkerValueString::PlatformPythonImplementation,
-                    operator: MarkerOperator::Equal,
-                    value: arcstr::literal!("GraalPy"),
-                }));
-            }
-            LanguageTag::Pyston { .. } => {
-                tree = tree.and(MarkerTree::expression(MarkerExpression::String {
-                    key: MarkerValueString::PlatformPythonImplementation,
-                    operator: MarkerOperator::Equal,
-                    value: arcstr::literal!("Pyston"),
-                }));
-            }
+        if let Some(implementation) = WheelImplementationMarkers::from_tag(*python_tag) {
+            tree = tree.and(implementation.coverage);
         }
 
         marker = marker.or(tree);
@@ -1432,6 +1402,10 @@ mod tests {
         assert_python_markers(
             "example-1.0-pp310-pypy310_pp73-any.whl",
             "python_full_version == '3.10.*' and platform_python_implementation == 'PyPy'",
+        );
+        assert_python_markers(
+            "example-1.0-graalpy313-graalpy253_313_native-macosx_11_0_arm64.whl",
+            "python_full_version == '3.13.*' and platform_python_implementation == 'GraalVM'",
         );
         assert_python_markers(
             "example-1.0-py310-none-any.whl",

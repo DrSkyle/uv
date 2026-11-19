@@ -38275,6 +38275,78 @@ fn lock_x86() -> Result<()> {
     Ok(())
 }
 
+/// A wheel's interpreter and OS must match the same supported environment.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_wheels_by_implementation() -> Result<()> {
+    let context = uv_test::test_context!("3.11");
+    let wheels = context.temp_dir.child("wheels");
+    wheels.create_dir_all()?;
+    let name = "demo".parse()?;
+    let version = "1.0.0".parse()?;
+    for tag in [
+        // The GraalPy environment lets i686 pass the initial machine check. Keep it when
+        // matching CPython on Linux, since 32-bit Python there can report 'x86_64'.
+        "cp311-cp311-manylinux_2_17_i686",
+        // Android before Python 3.13 reports sys_platform == 'linux'.
+        "cp311-cp311-android_24_x86_64",
+        "cp311-cp311-manylinux_2_17_x86_64",
+        "cp311-cp311-macosx_11_0_arm64",
+        "pp311-pypy311_pp73-manylinux_2_17_x86_64",
+        "pp311-pypy311_pp73-macosx_11_0_arm64",
+        "cp311-none-win_amd64.macosx_11_0_arm64",
+        "cp311.pp311-cp311.pypy311_pp73-win_amd64.macosx_11_0_arm64",
+        "graalpy313-graalpy253_313_native-manylinux_2_17_x86_64",
+        // Pyston reports `pyston` and `CPython`, ruling out every environment by implementation.
+        "pyston38-none-manylinux_2_17_x86_64",
+        "py3-none-any",
+    ] {
+        let (filename, wheel) = WheelBuilder::new(&name, &version).tag(tag).build();
+        wheels.child(filename).write_binary(&wheel)?;
+    }
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.8"
+        dependencies = ["demo"]
+
+        [tool.uv]
+        environments = [
+            "implementation_name == 'cpython' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+            "implementation_name == 'graalpy' and sys_platform != 'darwin'",
+            "platform_python_implementation == 'PyPy' and sys_platform == 'darwin'",
+        ]
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().args(["--no-index", "--find-links", "wheels"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
+    let lock = context.read("uv.lock").parse::<toml_edit::DocumentMut>()?;
+    assert_snapshot!(lock["package"][0], @r#"
+    name = "demo"
+    version = "1.0.0"
+    source = { registry = "wheels" }
+    wheels = [
+        { path = "demo-1.0.0-py3-none-any.whl" },
+        { path = "demo-1.0.0-cp311-cp311-manylinux_2_17_i686.whl" },
+        { path = "demo-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl" },
+        { path = "demo-1.0.0-cp311-cp311-android_24_x86_64.whl" },
+        { path = "demo-1.0.0-pp311-pypy311_pp73-macosx_11_0_arm64.whl" },
+        { path = "demo-1.0.0-graalpy313-graalpy253_313_native-manylinux_2_17_x86_64.whl" },
+        { path = "demo-1.0.0-cp311.pp311-cp311.pypy311_pp73-win_amd64.macosx_11_0_arm64.whl" },
+    ]
+    "#);
+
+    Ok(())
+}
+
 #[cfg(feature = "test-universal")]
 #[test]
 fn lock_script() -> Result<()> {
