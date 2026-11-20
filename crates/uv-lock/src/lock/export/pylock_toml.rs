@@ -44,7 +44,7 @@ use uv_warnings::warn_user_once;
 use uv_resolver_types::{AnnotatedDist, ResolverOutput};
 
 use crate::lock::export::{ExportableRequirements, VirtualPackages};
-use crate::lock::{Source, WheelTagHint, is_wheel_unreachable_for_marker};
+use crate::lock::{Source, WheelFallback, WheelTagHint, reachable_wheels};
 use crate::{Installable, LockError, LockHashError};
 
 /// Format an array so that each element is on its own line and has a trailing comma.
@@ -690,26 +690,22 @@ impl<'lock> PylockToml {
         build_options: &BuildOptions,
         index_locations: &IndexLocations,
     ) -> Result<(Option<PylockTomlSdist>, Option<Vec<PylockTomlWheel>>), PylockTomlErrorKind> {
+        let sdist = sdist.filter(|_| !build_options.no_build_package(node.name()));
         let wheels = if build_options.no_binary_package(node.name()) {
             Vec::new()
         } else {
-            wheels
-                .iter()
-                .filter(|wheel| {
-                    !is_wheel_unreachable_for_marker(
-                        &wheel.filename,
-                        requires_python,
-                        &node.marker,
-                        tags,
-                    )
-                })
+            let fallback = if sdist.is_some() {
+                WheelFallback::None
+            } else {
+                WheelFallback::Eligible
+            };
+            reachable_wheels(wheels.iter(), requires_python, &node.marker, tags, fallback)
                 .map(|wheel| {
                     PylockTomlWheel::from_registry(wheel, &wheel.filename.name, index_locations)
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
         let sdist = sdist
-            .filter(|_| !build_options.no_build_package(node.name()))
             .map(|sdist| PylockTomlSdist::from_registry(sdist, index_locations))
             .transpose()?;
         Ok((sdist, (!wheels.is_empty()).then_some(wheels)))

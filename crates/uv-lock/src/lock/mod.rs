@@ -9213,7 +9213,7 @@ struct Wheel {
 }
 
 impl Wheel {
-    /// Convert reachable wheels to lock entries, applying index hash requirements only to those wheels.
+    /// Convert the selected wheels to lock entries, applying index hash requirements to each entry.
     fn from_annotated_dist(
         annotated_dist: &AnnotatedDist,
         index_locations: &IndexLocations,
@@ -9225,15 +9225,18 @@ impl Wheel {
             ResolvedDist::Installed { .. } => unreachable!(),
             ResolvedDist::Installable { dist, .. } => dist.as_ref(),
         };
-        let is_reachable = |filename: &WheelFilename| {
-            !is_wheel_unreachable_for_marker(filename, requires_python, marker, None)
-        };
         let hashes = annotated_dist.hashes.as_slice();
         let wheels = match dist {
             Dist::Built(BuiltDist::Registry(dist)) => &dist.wheels,
             Dist::Source(uv_distribution_types::SourceDist::Registry(dist)) => &dist.wheels,
             Dist::Source(_) => return Ok(vec![]),
-            Dist::Built(dist) if !is_reachable(dist.wheel_filename()) => return Ok(vec![]),
+            // A direct wheel is the only artifact from which we can read metadata
+            // when validating the lockfile, even if its platform conflicts with the marker.
+            Dist::Built(dist)
+                if !is_wheel_eligible(dist.wheel_filename(), requires_python, None) =>
+            {
+                return Ok(vec![]);
+            }
             Dist::Built(BuiltDist::DirectUrl(dist)) => {
                 return Ok(vec![Self::from_direct_dist(dist, hashes)]);
             }
@@ -9244,13 +9247,12 @@ impl Wheel {
                 return Ok(vec![Self::from_git_path_dist(dist, hashes)]);
             }
         };
+        // Reject distributions from registries that don't match the index URL, as can occur with
+        // `--find-links`.
         let index = annotated_dist.index();
-        wheels
-            .iter()
-            // Reject distributions from registries that don't match the index URL, as can occur with
-            // `--find-links`.
-            .filter(|wheel| Some(&wheel.index) == index)
-            .filter(|wheel| is_reachable(&wheel.filename))
+        let wheels = wheels.iter().filter(|wheel| Some(&wheel.index) == index);
+        // Registry entries in uv.lock need no artifact for metadata validation.
+        reachable_wheels(wheels, requires_python, marker, None, WheelFallback::None)
             .map(|wheel| Self::from_registry_wheel(wheel, index_locations))
             .collect()
     }
@@ -10703,35 +10705,60 @@ fn canonical_marker_trees(
         .collect()
 }
 
-/// Filter out wheels that can't be selected for installation due to environment markers.
-///
-/// For example, a package included under `sys_platform == 'win32'` does not need Linux
-/// wheels.
-///
-/// Returns `true` if the wheel is definitely unreachable, and `false` if it may be reachable,
-/// including if the wheel tag isn't recognized.
-fn is_wheel_unreachable_for_marker(
-    filename: &WheelFilename,
+/// Which registry wheels to record if none match the package's marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelFallback {
+    None,
+    /// Keep wheels that satisfy the Python version and any explicit target tags.
+    Eligible,
+}
+
+/// Select registry wheels for the environments that need the package.
+fn reachable_wheels<'a>(
+    wheels: impl Iterator<Item = &'a RegistryBuiltWheel> + Clone,
     requires_python: &RequiresPython,
     marker: &UniversalMarker,
     tags: Option<&Tags>,
+    fallback: WheelFallback,
+) -> impl Iterator<Item = &'a RegistryBuiltWheel> {
+    let wheels =
+        wheels.filter(move |wheel| is_wheel_eligible(&wheel.filename, requires_python, tags));
+    filter_wheels(
+        wheels,
+        fallback == WheelFallback::Eligible,
+        move |filename| marker.is_true() || !is_wheel_unreachable_for_marker(filename, marker),
+    )
+}
+
+/// If a wheel is required and none match the marker, retain the eligible wheels.
+///
+/// For example, pip validates that every package in `pylock.toml` has a distribution
+/// before it evaluates the package's marker.
+fn filter_wheels<'a>(
+    wheels: impl Iterator<Item = &'a RegistryBuiltWheel> + Clone,
+    require_wheel: bool,
+    matches: impl Fn(&WheelFilename) -> bool + Clone,
+) -> impl Iterator<Item = &'a RegistryBuiltWheel> + Clone {
+    let keep_all = require_wheel && !wheels.clone().any(|wheel| matches(&wheel.filename));
+    wheels.filter(move |wheel| keep_all || matches(&wheel.filename))
+}
+
+/// Check the wheel constraints that apply independently of the package's marker.
+fn is_wheel_eligible(
+    filename: &WheelFilename,
+    requires_python: &RequiresPython,
+    tags: Option<&Tags>,
 ) -> bool {
     // TODO(konsti): Include wheel variants in lockfiles when supported.
-    if filename.variant().is_some() {
-        return true;
-    }
-    if let Some(tags) = tags
-        && !filename.compatibility(tags).is_compatible()
-    {
-        return true;
-    }
-    // Remove wheels that don't match `requires-python` and can't be selected for installation.
-    if !requires_python.matches_wheel_tag(filename) {
-        return true;
-    }
+    filename.variant().is_none()
+        && tags.is_none_or(|tags| filename.compatibility(tags).is_compatible())
+        && requires_python.matches_wheel_tag(filename)
+}
 
-    // Filter by platform tags.
-
+/// Check whether the wheel's platform is incompatible with the package's marker.
+///
+/// For example, a package included under `sys_platform == 'win32'` does not need Linux wheels.
+fn is_wheel_unreachable_for_marker(filename: &WheelFilename, marker: &UniversalMarker) -> bool {
     // Naively, we'd check whether `platform_system == 'Linux'` is disjoint, or
     // `os_name == 'posix'` is disjoint, or `sys_platform == 'linux'` is disjoint (each on its
     // own sufficient to exclude linux wheels), but due to

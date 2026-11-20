@@ -7,7 +7,7 @@ use uv_pep508::MarkerTree;
 use uv_platform_tags::{Arch, Os, Platform, Tags, TagsOptions};
 use uv_resolver_types::{ConflictMarker, UniversalMarker};
 
-use super::is_wheel_unreachable_for_marker;
+use super::{is_wheel_eligible, is_wheel_unreachable_for_marker};
 
 const WINDOWS_ARM: &str =
     "os_name == 'nt' and sys_platform == 'win32' and platform_machine == 'ARM64'";
@@ -42,7 +42,8 @@ fn assert_reachability(
     });
 
     assert_eq!(
-        is_wheel_unreachable_for_marker(&filename, &requires_python, &marker, tags.as_ref()),
+        !is_wheel_eligible(&filename, &requires_python, tags.as_ref())
+            || is_wheel_unreachable_for_marker(&filename, &marker),
         expected_unreachable,
         "{case}: {filename}",
     );
